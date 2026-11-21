@@ -1,141 +1,169 @@
-//! State machine for SQLite Client.
-//! States: QueryInput, Results, Samples, History
+//! Rendering and persistence for SQL Explorer. The SQL engine and the screen
+//! state machine are in `sql-explorer-core` (host-tested); this file maps device
+//! state to those, saves the query history, and draws.
+//!
+//! The tables live in memory for the session only. Only the history is stored.
 
-extern crate alloc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use crate::sql::{Database, QueryResult, SAMPLE_QUERIES};
+use gam::GlyphStyle;
+use precursor_appkit::keys::Key;
+use precursor_appkit::layout::rows_that_fit;
+use precursor_appkit::screen::{Screen, MARGIN};
+use precursor_appkit::store::Store;
+use sql_explorer_core::{LoadError, Mode, Model, Out, Saved, Viewport};
 
-const KEY_UP: char = '\u{F700}';
-const KEY_DOWN: char = '\u{F701}';
-const KEY_LEFT: char = '\u{F702}';
-const KEY_RIGHT: char = '\u{F703}';
-const KEY_ENTER: char = '\u{000D}';
-const KEY_BACKSPACE: char = '\u{0008}';
-const KEY_MENU: char = '\u{2234}';
+pub const DICT: &str = "sql-explorer";
+const HISTORY_KEY: &str = "history";
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AppState { QueryInput, Results, Samples, History }
+/// Average glyph widths assumed when turning pixels into characters per line.
+/// Deliberately wide so a line of capitals still fits.
+const GLYPH_W: isize = 8;
+const MONO_W: isize = 10;
 
-pub struct SqlApp {
-    pub state: AppState,
-    pub needs_redraw: bool,
-    pub db: Database,
-    pub input: String,
-    pub result: Option<QueryResult>,
-    pub result_scroll: usize,
-    pub sample_cursor: usize,
-    pub history: Vec<String>,
-    pub history_cursor: usize,
-    pub history_scroll: usize,
+#[derive(PartialEq, Eq)]
+pub enum Action {
+    Stay,
+    Leave,
 }
 
-impl SqlApp {
-    pub fn new() -> Self {
-        Self {
-            state: AppState::QueryInput,
-            needs_redraw: true,
-            db: Database::with_samples(),
-            input: String::new(),
-            result: None,
-            result_scroll: 0,
-            sample_cursor: 0,
-            history: Vec::new(),
-            history_cursor: 0,
-            history_scroll: 0,
-        }
+pub struct App {
+    screen: Screen,
+    store: Store,
+    model: Model,
+    /// Set when saved data couldn't be used; blocks saves so it isn't overwritten.
+    read_only: bool,
+    notice: String,
+}
+
+impl App {
+    pub fn new(screen: Screen, store: Store) -> Self {
+        let mut app = Self { screen, store, model: Model::new(), read_only: false, notice: String::new() };
+        app.reload();
+        app
     }
 
-    fn execute_query(&mut self) {
-        if self.input.is_empty() { return; }
-        let result = self.db.execute(&self.input);
-        self.history.push(self.input.clone());
-        self.result = Some(result);
-        self.result_scroll = 0;
-        self.state = AppState::Results;
-    }
+    pub fn screen(&self) -> &Screen { &self.screen }
 
-    pub fn handle_key(&mut self, key: char) -> bool {
-        self.needs_redraw = true;
-        match self.state {
-            AppState::QueryInput => self.key_input(key),
-            AppState::Results => self.key_results(key),
-            AppState::Samples => self.key_samples(key),
-            AppState::History => self.key_history(key),
-        }
-    }
-
-    fn key_input(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU => return false,
-            KEY_ENTER => { self.execute_query(); }
-            KEY_BACKSPACE => { self.input.pop(); }
-            KEY_RIGHT => { self.sample_cursor = 0; self.state = AppState::Samples; }
-            KEY_UP => {
-                if !self.history.is_empty() {
-                    self.history_cursor = self.history.len() - 1;
-                    self.history_scroll = if self.history.len() > 10 { self.history.len() - 10 } else { 0 };
-                    self.state = AppState::History;
+    /// (Re)load the saved query history. Called at start and whenever the set
+    /// of open PDDB bases changes: history from a just-locked basis leaves
+    /// memory. The in-memory tables are not touched.
+    pub fn reload(&mut self) {
+        self.read_only = false;
+        self.notice.clear();
+        self.model.forget_history();
+        match self.store.load::<Saved>(HISTORY_KEY) {
+            Ok(Some(saved)) => {
+                if let Err(LoadError::NewerVersion(v)) = self.model.restore(saved) {
+                    log::warn!("saved history version {} is newer than this app", v);
+                    self.read_only = true;
+                    self.notice = "Saved data is from a newer version".into();
                 }
             }
-            c if c >= ' ' && c <= '~' => {
-                if self.input.len() < 120 { self.input.push(c); }
+            Ok(None) => {}
+            Err(e) => {
+                log::error!("couldn't load saved history: {:?}", e);
+                self.read_only = true;
+                self.notice = "Couldn't read saved data".into();
             }
-            _ => {}
         }
-        true
+        self.draw();
     }
 
-    fn key_results(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU | KEY_LEFT => { self.state = AppState::QueryInput; }
-            KEY_DOWN => { self.result_scroll += 1; }
-            KEY_UP => { if self.result_scroll > 0 { self.result_scroll -= 1; } }
-            KEY_ENTER => {
-                // Run another query
-                self.input = String::new();
-                self.state = AppState::QueryInput;
-            }
-            _ => {}
+    fn save(&mut self) {
+        if !self.model.dirty() || self.read_only {
+            return;
         }
-        true
+        match self.store.save(HISTORY_KEY, &self.model.saved()) {
+            Ok(()) => {
+                self.model.mark_saved();
+                self.notice.clear();
+            }
+            Err(e) => {
+                log::error!("save failed: {:?}", e);
+                self.notice = "Save failed".into();
+            }
+        }
     }
 
-    fn key_samples(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU | KEY_LEFT => { self.state = AppState::QueryInput; }
-            KEY_UP => { if self.sample_cursor > 0 { self.sample_cursor -= 1; } }
-            KEY_DOWN => { if self.sample_cursor < SAMPLE_QUERIES.len() - 1 { self.sample_cursor += 1; } }
-            KEY_ENTER => {
-                self.input = String::from(SAMPLE_QUERIES[self.sample_cursor]);
-                self.execute_query();
-            }
-            _ => {}
+    pub fn on_key(&mut self, key: Key) -> Action {
+        if self.model.on_key(key) == Out::Leave {
+            self.save();
+            return Action::Leave;
         }
-        true
+        Action::Stay
     }
 
-    fn key_history(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU | KEY_LEFT => { self.state = AppState::QueryInput; }
-            KEY_UP => {
-                if self.history_cursor > 0 {
-                    self.history_cursor -= 1;
-                    if self.history_cursor < self.history_scroll { self.history_scroll = self.history_cursor; }
+    pub fn on_foreground(&mut self) {
+        self.screen.refresh_size();
+        self.draw();
+    }
+
+    /// Save only if the history changed.
+    pub fn on_background(&mut self) { self.save(); }
+
+    pub fn draw(&mut self) {
+        let s = &self.screen;
+        s.clear();
+        let top = s.header(&self.model.title());
+        let bottom = s.footer(self.model.hint());
+
+        let small_h = s.line_height(GlyphStyle::Small);
+        let mono_h = s.line_height(GlyphStyle::Monospace);
+        let row_h = s.line_height(GlyphStyle::Regular) + 4;
+        let notice_h = if self.notice.is_empty() { 0 } else { small_h };
+        let content_bottom = bottom - notice_h;
+        let status_h = small_h;
+        let avail = content_bottom - top;
+        let width = s.size().x - 2 * MARGIN;
+        let cols = (width / GLYPH_W).max(8) as usize;
+        self.model.set_viewport(Viewport {
+            list_rows: rows_that_fit(avail - status_h, row_h),
+            text_rows: rows_that_fit(avail - small_h, mono_h),
+            text_cols: (width / MONO_W).max(8) as usize,
+        });
+
+        match self.model.mode() {
+            Mode::Query => {
+                let mut y = top;
+                y += s.text(y, GlyphStyle::Small, "SQL (F3 = what is supported):");
+                let err_h = if self.model.error().is_some() { small_h * 3 } else { 0 };
+                let rows = rows_that_fit(content_bottom - y - err_h - status_h, small_h);
+                for line in self.model.input_view(cols, rows) {
+                    s.text(y, GlyphStyle::Small, &line);
+                    y += small_h;
+                }
+                if let Some(e) = self.model.error() {
+                    s.para(content_bottom - err_h - status_h, content_bottom - status_h, GlyphStyle::Small, e);
+                }
+                let tables: String = self.model.status().chars().take(cols).collect();
+                s.text(content_bottom - status_h, GlyphStyle::Small, &tables);
+            }
+            Mode::Results => {
+                let mut y = top;
+                for line in self.model.result_window() {
+                    s.text_in(
+                        gam::menu::Point::new(MARGIN, y),
+                        gam::menu::Point::new(s.size().x - MARGIN, y + mono_h),
+                        GlyphStyle::Monospace,
+                        &line,
+                    );
+                    y += mono_h;
+                }
+                if self.model.result_is_message_only() {
+                    s.text(top, GlyphStyle::Regular, "Done.");
+                }
+                s.text(content_bottom - small_h, GlyphStyle::Small, &self.model.result_position());
+            }
+            Mode::Samples | Mode::History | Mode::Help => {
+                let items = self.model.list_items();
+                s.list(top, content_bottom - status_h, &items, self.model.list_state());
+                if let Some(note) = self.model.empty_note() {
+                    s.text(top, GlyphStyle::Regular, note);
                 }
             }
-            KEY_DOWN => {
-                if self.history_cursor < self.history.len() - 1 {
-                    self.history_cursor += 1;
-                    if self.history_cursor >= self.history_scroll + 10 { self.history_scroll = self.history_cursor - 9; }
-                }
-            }
-            KEY_ENTER => {
-                self.input = self.history[self.history_cursor].clone();
-                self.execute_query();
-            }
-            _ => {}
         }
-        true
+        if !self.notice.is_empty() {
+            s.text(content_bottom, GlyphStyle::Small, &self.notice);
+        }
+        s.flush();
     }
 }

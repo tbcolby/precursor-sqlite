@@ -1,0 +1,14 @@
+{
+    "sql-explorer": {
+        "context_name": "SQL Explorer",
+        "menu_name": {
+            "appmenu.sql-explorer": {
+                "en": "SQL Explorer",
+                "en-tts": "SQL Explorer",
+                "fr": "SQL Explorer",
+                "ja": "SQL Explorer",
+                "zh": "SQL Explorer"
+            }
+        }
+    }
+}

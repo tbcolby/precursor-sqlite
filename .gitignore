@@ -1,2 +1,3 @@
-/target
+target/
+screenshots/
 Cargo.lock
