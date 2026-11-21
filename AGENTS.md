@@ -1,18 +1,12 @@
-# SQLite Client — Agent Evolution Report
-## Agents Used
-1. **ideation.md** — SQL commands, sample data design
-2. **architecture.md** — Query engine, tokenizer, state machine
-3. **encoding.md** — SQL tokenizer with quoted string handling
-## New Patterns
-- **In-memory SQL engine**: Vec-based tables with tokenized query parsing and WHERE filtering.
-- **SQL tokenizer**: Handles quoted strings, strips parens/commas, preserves token order.
-- **Tabular display**: Column-aligned output with fixed-width truncation.
-## Metrics
-| Metric | Value |
-|--------|-------|
-| Source files | 4 |
-| Estimated LOC | ~750 |
-| States | 4 |
-| SQL commands | 6 |
-| Sample tables | 3 |
-| Sample queries | 10 |
+# SQL Explorer: agent notes
+
+Rebuilt 2026-11-21 on `precursor-appkit` (strategy R). Read `CLAUDE.md` for layout.
+Invariants with tests in `core/`:
+
+- Multi-column `INSERT` (also several rows, with a column list) and `CREATE TABLE`
+  work; every built-in sample query runs.
+- Decimal columns compare numerically (`price < 5` is exactly right); NULL
+  comparisons are unknown; unsupported clauses are rejected by name.
+- No query, however mangled, panics.
+- The README states the exact subset and does not claim SQLite compatibility.
+- Every screen exits on Backspace or F4.
